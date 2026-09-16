@@ -73,6 +73,7 @@ type Tracer struct {
 	logger            schemas.Logger
 	obsPlugins        atomic.Pointer[[]*obsPluginSlot]
 	cachedHdrPatterns atomic.Pointer[[]string]
+	cachedDemand      atomic.Pointer[TraceDemand]
 	flushWG           sync.WaitGroup
 }
 
@@ -141,6 +142,50 @@ func (t *Tracer) SetObservabilityPlugins(obsPlugins []schemas.ObservabilityPlugi
 	}
 	t.cachedHdrPatterns.Store(&patterns)
 
+	demand := TraceDemand{Any: len(slots) > 0}
+	for _, plugin := range obsPlugins {
+		if plugin == nil {
+			continue
+		}
+		// Unstated demand is full demand: a connector that says nothing is
+		// assumed to read everything, so adding this cannot silently starve one.
+		if c, ok := plugin.(interface{ ConsumesContent() bool }); !ok || c.ConsumesContent() {
+			demand.Content = true
+		}
+	}
+	t.cachedDemand.Store(&demand)
+}
+
+// spanBuildOptions derives the per-request build options from connector demand,
+// so message content is summarized and marshalled only when something reads it.
+func (t *Tracer) spanBuildOptions() SpanBuildOptions {
+	return SpanBuildOptions{WantContent: t.Demand().Content}
+}
+
+// TraceDemand is the union of what the attached connectors read. It is computed
+// once at registration and loaded atomically, so the per-request path never
+// rebuilds it.
+//
+// Producing what nobody consumes is the single largest cost in the tracing path:
+// with no connector attached the trace was still deep-cloned for export, and
+// message content was still summarized and marshalled.
+type TraceDemand struct {
+	// Any is false when no observability plugin is attached at all.
+	Any bool
+	// Content is true when at least one connector reads message content.
+	Content bool
+}
+
+// Demand returns the connector demand union. A zero value (no connectors) is
+// returned when none have been registered.
+func (t *Tracer) Demand() TraceDemand {
+	if t == nil {
+		return TraceDemand{}
+	}
+	if d := t.cachedDemand.Load(); d != nil {
+		return *d
+	}
+	return TraceDemand{}
 }
 
 // ShouldCaptureRequestHeaders reports whether any observability plugin has opted into
@@ -407,12 +452,16 @@ func (t *Tracer) PopulateLLMRequestAttributes(handle schemas.SpanHandle, req *sc
 	// The typed record is the source of truth; the attribute map is rendered
 	// from it so both paths cannot drift. Connectors read span.LLM directly as
 	// they migrate off the map.
-	// The typed record is the source of truth; the attribute map is rendered
-	// from it so both paths cannot drift. Connectors read span.LLM directly as
-	// they migrate off the map.
-	span.LLM = BuildLLMSpanData(req, nil, nil, SpanBuildOptions{WantContent: true})
-	attrs := span.LLM.Attributes()
-	span.SetAttributes(attrs)
+	span.LLM = BuildLLMSpanData(req, nil, nil, t.spanBuildOptions())
+	// Rendering the record into the attribute map is only worth doing when a
+	// connector will read it; it is the single largest allocation left on the
+	// path. The typed record is always attached, so a connector registered
+	// mid-flight still finds the data, just not the map form.
+	var attrs map[string]any
+	if t.Demand().Any {
+		attrs = span.LLM.Attributes()
+		span.SetAttributes(attrs)
+	}
 
 	// Propagate input messages and request model to root span so observability backends (e.g. Langfuse)
 	// can display Input and model name at the top-level trace without requiring users to drill into llm.call.
@@ -461,10 +510,11 @@ func (t *Tracer) PopulateLLMResponseAttributes(ctx *schemas.BifrostContext, hand
 	if span.LLM == nil {
 		span.LLM = &schemas.LLMSpanData{}
 	}
-	ApplyResponse(span.LLM, resp, err, SpanBuildOptions{WantContent: true})
-	// Re-rendered in full: the request keys resolve to the values already on the
-	// span, so rewriting them is a no-op.
-	respAttrs := span.LLM.Attributes()
+	ApplyResponse(span.LLM, resp, err, t.spanBuildOptions())
+	var respAttrs map[string]any
+	if t.Demand().Any {
+		respAttrs = span.LLM.ResponseAttributes()
+	}
 	// A cancelled stream arrives here with an accumulated response whose usage
 	// is missing the final chunk, so its aggregate token counts read zero. When
 	// the error carries the authoritative BilledUsage, drop those zeros from
@@ -969,8 +1019,25 @@ func (t *Tracer) CompleteAndFlushTrace(traceID string) {
 	if strings.TrimSpace(traceID) == "" {
 		return
 	}
+	traceID = strings.TrimSpace(traceID)
+
+	// Nothing is listening: end the trace and return it to the pool, skipping the
+	// redaction pass, the export snapshot and the flush goroutine. The snapshot
+	// alone is ~half of all allocations in the process, and it used to run
+	// whether or not a connector existed to receive it.
+	var slots []*obsPluginSlot
+	if loaded := t.obsPlugins.Load(); loaded != nil {
+		slots = *loaded
+	}
+	if len(slots) == 0 {
+		if completedTrace := t.EndTrace(traceID); completedTrace != nil {
+			t.ReleaseTrace(completedTrace)
+		}
+		return
+	}
+
 	t.flushWG.Go(func() {
-		completedTrace := t.EndTrace(strings.TrimSpace(traceID))
+		completedTrace := t.EndTrace(traceID)
 		if completedTrace == nil {
 			return
 		}
@@ -1000,11 +1067,6 @@ func (t *Tracer) CompleteAndFlushTrace(traceID string) {
 		// the breakdown) get the full trace. Computed once; returns exportTrace unchanged
 		// when there are no breakdown spans to strip.
 		connectorTrace := exportTrace.WithoutOverheadBreakdownSpans()
-
-		var slots []*obsPluginSlot
-		if loaded := t.obsPlugins.Load(); loaded != nil {
-			slots = *loaded
-		}
 
 		// Fan out rather than iterate: every connector receives the trace on its own
 		// goroutine, so a connector doing blocking network I/O can never delay another.
@@ -1058,6 +1120,11 @@ func (t *Tracer) CompleteAndFlushTrace(traceID string) {
 		// Join before the deferred ReleaseTrace runs: connectors read exportTrace, and
 		// the pooled trace it was snapshotted from must not be recycled underneath them.
 		wg.Wait()
+
+		// Every connector has returned, so the snapshot's spans can be recycled.
+		// This assumes Inject does not retain the trace past its return; the
+		// built-in connectors all convert or marshal synchronously.
+		exportTrace.ReleaseSnapshot()
 	})
 }
 

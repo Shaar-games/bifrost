@@ -318,3 +318,46 @@ func TestCostAttributesOmitsZeroCategories(t *testing.T) {
 		t.Errorf("nil cost rendered %d attributes, want none", len(got))
 	}
 }
+
+// TestAssertCostBreakdownCatchesMistakes checks the shared assertion itself: it
+// must pass on a faithful export and fail on each way a connector can get the
+// breakdown wrong. An assertion used by six connectors has to be trustworthy.
+func TestAssertCostBreakdownCatchesMistakes(t *testing.T) {
+	faithful := CostAttributes(ExportFixtureCost())
+	if problems := AssertCostBreakdown(CostAttributeLookup(faithful)); len(problems) != 0 {
+		t.Errorf("faithful export reported problems: %v", problems)
+	}
+
+	t.Run("missing category", func(t *testing.T) {
+		attrs := CostAttributes(ExportFixtureCost())
+		delete(attrs, AttrBifrostCostOutputReasoning)
+		if len(AssertCostBreakdown(CostAttributeLookup(attrs))) == 0 {
+			t.Error("a dropped category was not reported")
+		}
+	})
+
+	t.Run("wrong value", func(t *testing.T) {
+		attrs := CostAttributes(ExportFixtureCost())
+		attrs[AttrBifrostCostGuardrail] = 0.99
+		if len(AssertCostBreakdown(CostAttributeLookup(attrs))) == 0 {
+			t.Error("a wrong value was not reported")
+		}
+	})
+
+	t.Run("cross-wired category", func(t *testing.T) {
+		// The BigQuery pickDetail mistake: two categories fed from one key.
+		attrs := CostAttributes(ExportFixtureCost())
+		attrs[AttrBifrostCostInputAudio] = attrs[AttrBifrostCostInputText]
+		if len(AssertCostBreakdown(CostAttributeLookup(attrs))) == 0 {
+			t.Error("a cross-wired category was not reported")
+		}
+	})
+
+	t.Run("sides do not reconcile", func(t *testing.T) {
+		attrs := CostAttributes(ExportFixtureCost())
+		attrs[AttrUsageCost] = 2.00
+		if len(AssertCostBreakdown(CostAttributeLookup(attrs))) == 0 {
+			t.Error("a total that does not match its sides was not reported")
+		}
+	})
+}

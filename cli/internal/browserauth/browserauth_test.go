@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,77 @@ func TestSignInCompletesLoopbackPKCE(t *testing.T) {
 	}
 	if response.AccessToken != "ck-bf-agent-access" || response.User.Email != "alice@example.com" {
 		t.Fatalf("unexpected response: %#v", response)
+	}
+}
+
+func TestCallbackServerShowsCLICompletionAfterExchange(t *testing.T) {
+	results := make(chan callbackResult, 1)
+	server := callbackServer(
+		"state-1",
+		results,
+		func(code string) (TokenResponse, error) {
+			if code != "one-time-code" {
+				t.Fatalf("code = %q, want one-time-code", code)
+			}
+			return TokenResponse{AccessToken: "access", RefreshToken: "refresh"}, nil
+		},
+	)
+	request := httptest.NewRequest(http.MethodGet, "/callback?code=one-time-code&state=state-1", nil)
+	recorder := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if location := recorder.Header().Get("Location"); location != "" {
+		t.Fatalf("unexpected completion redirect: %q", location)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"Bifrost CLI sign-in complete",
+		"You can close this window",
+		"width: min(576px, 100%)",
+		"font-size: 20px",
+		"font-size: 14px",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("completion page missing %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, "Bifrost Edge") || strings.Contains(body, "return to the terminal") {
+		t.Fatalf("completion page retained non-CLI copy: %q", body)
+	}
+	if policy := recorder.Header().Get("Content-Security-Policy"); !strings.Contains(policy, "default-src 'none'") {
+		t.Fatalf("completion page CSP = %q", policy)
+	}
+	result := <-results
+	if result.err != nil || result.response.AccessToken != "access" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCallbackServerDoesNotRedirectWhenExchangeFails(t *testing.T) {
+	results := make(chan callbackResult, 1)
+	wantErr := errors.New("exchange failed")
+	server := callbackServer(
+		"state-1",
+		results,
+		func(string) (TokenResponse, error) { return TokenResponse{}, wantErr },
+	)
+	request := httptest.NewRequest(http.MethodGet, "/callback?code=one-time-code&state=state-1", nil)
+	recorder := httptest.NewRecorder()
+
+	server.Handler.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+	if location := recorder.Header().Get("Location"); location != "" {
+		t.Fatalf("unexpected redirect after failed exchange: %q", location)
+	}
+	if result := <-results; !errors.Is(result.err, wantErr) {
+		t.Fatalf("result error = %v, want %v", result.err, wantErr)
 	}
 }
 

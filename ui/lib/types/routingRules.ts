@@ -5,6 +5,15 @@
 
 import { RuleGroupType } from "react-querybuilder";
 
+/** A fallback that may pin a provider key. The API accepts and returns the legacy "provider/model" string for unpinned entries. */
+export interface RoutingFallback {
+	provider?: string;
+	model?: string;
+	key_id?: string;
+}
+
+export type RoutingFallbackWire = string | RoutingFallback;
+
 export interface RoutingTarget {
 	provider?: string;
 	model?: string;
@@ -18,7 +27,7 @@ export interface RoutingRule {
 	description: string;
 	cel_expression: string;
 	targets: RoutingTarget[];
-	fallbacks?: string[];
+	fallbacks?: RoutingFallbackWire[];
 	scope: "global" | "team" | "customer" | "virtual_key" | "user";
 	scope_id?: string;
 	priority: number;
@@ -34,7 +43,7 @@ export interface CreateRoutingRuleRequest {
 	description?: string;
 	cel_expression?: string;
 	targets: RoutingTarget[];
-	fallbacks?: string[];
+	fallbacks?: RoutingFallbackWire[];
 	scope: string;
 	scope_id?: string;
 	priority: number;
@@ -77,7 +86,7 @@ export interface RoutingRuleFormData {
 	description: string;
 	cel_expression: string;
 	targets: RoutingTargetFormData[];
-	fallbacks: string[];
+	fallbacks: RoutingFallback[];
 	scope: string;
 	scope_id: string;
 	priority: number;
@@ -103,6 +112,12 @@ export const ROUTING_RULE_SCOPES = [
 	{ value: RoutingRuleScope.Customer, label: "Customer" },
 	{ value: RoutingRuleScope.VirtualKey, label: "Virtual Key" },
 ];
+
+export const DEFAULT_ROUTING_FALLBACK: RoutingFallback = {
+	provider: "",
+	model: "",
+	key_id: "",
+};
 
 export const DEFAULT_ROUTING_TARGET: RoutingTargetFormData = {
 	provider: "",

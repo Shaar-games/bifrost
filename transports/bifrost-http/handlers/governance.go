@@ -467,6 +467,28 @@ type UpdateRateLimitRequest struct {
 	RequestResetDuration *string `json:"request_reset_duration,omitempty"` // e.g., "30s", "5m", "1h", "1d", "1w", "1M"
 }
 
+// teamUpdateSetsOwnLimits reports whether this update would leave the team holding a budget or a rate
+// limit of its own. Clearing them - an empty budget list, a rate limit with neither maximum - is how
+// an operator moves a team onto an access profile, so it does not count as setting one.
+func teamUpdateSetsOwnLimits(req *UpdateTeamRequest) bool {
+	if len(req.Budgets) > 0 {
+		return true
+	}
+	return req.RateLimit != nil && (req.RateLimit.TokenMaxLimit != nil || req.RateLimit.RequestMaxLimit != nil)
+}
+
+// customerUpdateSetsOwnLimits is teamUpdateSetsOwnLimits for a customer, which also accepts the
+// deprecated single budget - cleared by carrying no maximum.
+func customerUpdateSetsOwnLimits(req *UpdateCustomerRequest) bool {
+	if req.Budgets != nil && len(*req.Budgets) > 0 {
+		return true
+	}
+	if req.Budget != nil && req.Budget.MaxLimit != nil {
+		return true
+	}
+	return req.RateLimit != nil && (req.RateLimit.TokenMaxLimit != nil || req.RateLimit.RequestMaxLimit != nil)
+}
+
 func isBudgetRemovalRequest(req *UpdateBudgetRequest) bool {
 	return req != nil && req.MaxLimit == nil && req.ResetDuration == nil
 }
@@ -2993,6 +3015,24 @@ func (h *GovernanceHandler) updateTeam(ctx *fasthttp.RequestCtx) {
 	// reconciliation and collected there, so the in-memory store can be cleared
 	// once the transaction commits.
 	usageReset := &budgetUsageReset{requested: req.ResetBudgetUsage != nil && *req.ResetBudgetUsage}
+	// A team governed another way - by an access profile attached to it, in the enterprise build -
+	// cannot also carry budgets and a rate limit of its own: they would be a second cap on the same
+	// keys, and one that is invisible in the profile's editor. Every other field here, and every edit
+	// to a team that holds no profile, is untouched.
+	if teamUpdateSetsOwnLimits(&req) {
+		governedBy, err := governance.LegacyLimitsGovernedBy(ctx, governance.LegacyLimitHolderTeam, teamID)
+		if err != nil {
+			// Fail closed: without knowing whether something else governs this team, accepting a budget
+			// could put a second cap on its keys.
+			logger.Error("failed to check whether team %s is governed: %v", teamID, err)
+			SendError(ctx, 503, "unable to verify whether an access profile governs this team, please retry")
+			return
+		}
+		if governedBy != "" {
+			SendError(ctx, 409, "this team is governed by access profile \""+governedBy+"\", so it cannot have budgets or a rate limit of its own - edit the access profile instead")
+			return
+		}
+	}
 	// Whether this request switches alignment on. Captured before the update so the
 	// open windows can be adopted onto the calendar grid afterwards instead of
 	// being reset out from under the operator; see adoptCalendarAlignment.
@@ -3434,6 +3474,24 @@ func (h *GovernanceHandler) updateCustomer(ctx *fasthttp.RequestCtx) {
 	if req.Budgets != nil && req.Budget != nil {
 		SendError(ctx, 400, "only one of 'budget' or 'budgets' may be set")
 		return
+	}
+	// A customer governed another way - by an access profile, in the enterprise build - cannot also
+	// carry budgets and a rate limit of its own: they would be a second cap on the same keys, and one
+	// that is invisible in the profile's editor. Editing a customer that holds no profile is
+	// untouched, and so is every field here but these two.
+	if customerUpdateSetsOwnLimits(&req) {
+		governedBy, err := governance.LegacyLimitsGovernedBy(ctx, governance.LegacyLimitHolderCustomer, customerID)
+		if err != nil {
+			// Fail closed: without knowing whether something else governs this customer, accepting a
+			// budget could put a second cap on its keys.
+			logger.Error("failed to check whether customer %s is governed: %v", customerID, err)
+			SendError(ctx, 503, "unable to verify whether an access profile governs this customer, please retry")
+			return
+		}
+		if governedBy != "" {
+			SendError(ctx, 409, "this customer is governed by access profile \""+governedBy+"\", so it cannot have budgets or a rate limit of its own - edit the access profile instead")
+			return
+		}
 	}
 	// Fetching customer from database
 	customer, err := h.configStore.GetCustomer(ctx, customerID)

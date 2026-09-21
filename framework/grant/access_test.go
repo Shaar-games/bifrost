@@ -1,6 +1,7 @@
 package grant
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -1664,4 +1665,224 @@ func assertPermitsAre(t *testing.T, got []schemas.Permit, want ...schemas.Permit
 	for i := range want {
 		assert.Same(t, want[i], got[i], "permit %d", i)
 	}
+}
+
+// A permit that grants every provider names none, so the answers that are a list of providers have
+// nothing to enumerate and must be completed from the deployment's own set. Without this, a permit
+// meaning "every provider, with overrides for these two" reads as "only these two", and the listing
+// and routing layers that consume those lists refuse what the request path admits.
+func TestAllowAllProvidersCompletesTheProviderLists(t *testing.T) {
+	// The shape a deployment actually has: allow-all, plus one provider permit carrying an override.
+	newBase := func() *Permit {
+		return newPermit(permitSpec{
+			Type: PermitVirtualKey, ID: "vk1", Name: "Caller Key",
+			AllowAllProviders: true,
+			ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "bedrock", AllowedModels: []string{"*"}, Weight: ptr(1.0), KeyIDs: []string{"key-1"}},
+			},
+		})
+	}
+
+	t.Run("granted providers include one no permit names", func(t *testing.T) {
+		access := NewAccess(held(newBase()), nil, "", nil, configured("bedrock", "anthropic", "openai"))
+
+		assert.ElementsMatch(t, []string{"bedrock", "anthropic", "openai"}, access.GrantedProvidersForModel("claude-haiku-4-5"))
+	})
+
+	t.Run("candidates include one no permit names, unweighted and unrestricted", func(t *testing.T) {
+		access := NewAccess(held(newBase()), nil, "", nil, configured("bedrock", "anthropic"))
+
+		candidates := access.ProvidersForModel("claude-haiku-4-5")
+		require.Len(t, candidates, 2)
+		byProvider := map[string]schemas.ProviderCandidate{}
+		for _, candidate := range candidates {
+			byProvider[candidate.Provider] = candidate
+		}
+		// Weight is something a provider permit expresses, so a provider none names carries none.
+		// Load balancing drops unweighted candidates, which is why adding them cannot change which
+		// provider it selects — only what the routing trail is able to name.
+		require.Contains(t, byProvider, "anthropic")
+		assert.Nil(t, byProvider["anthropic"].Weight)
+		assert.Equal(t, schemas.WhiteList{Wildcard}, byProvider["anthropic"].KeyIDs)
+		assert.Equal(t, ptr(1.0), byProvider["bedrock"].Weight)
+	})
+
+	t.Run("a provider its own permit refuses is not reopened", func(t *testing.T) {
+		base := newPermit(permitSpec{
+			Type: PermitVirtualKey, ID: "vk1", Name: "Caller Key",
+			AllowAllProviders: true,
+			ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"gpt-4o"}},
+			},
+		})
+		access := NewAccess(held(base), nil, "", nil, configured("openai", "anthropic"))
+
+		// openai holds a permit and that permit does not allow this model; allow-all governs only
+		// providers nothing ruled on.
+		assert.Equal(t, []string{"anthropic"}, access.GrantedProvidersForModel("claude-haiku-4-5"))
+	})
+
+	t.Run("an intersecting scope is not widened", func(t *testing.T) {
+		scoping := newPermit(permitSpec{
+			Type: PermitProject, ID: "p1", Name: "Project",
+			ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "bedrock", AllowedModels: []string{"*"}},
+			},
+		})
+		access := NewAccess(held(newBase()), scoping, Intersect, nil, configured("bedrock", "anthropic"))
+
+		// The caller may reach every provider, the project only bedrock, and an intersection is the
+		// narrower of the two.
+		assert.Equal(t, []string{"bedrock"}, access.GrantedProvidersForModel("claude-haiku-4-5"))
+	})
+
+	// The caller's permits are read as one, so a provider permit that refuses this model has not
+	// answered for the provider: another permit may still grant it. Both answers have to say so, and
+	// both have to say the same thing, or a listing refuses what the request path admits.
+	t.Run("a provider one permit refuses is still offered where another grants it", func(t *testing.T) {
+		refusing := newPermit(permitSpec{
+			Type: PermitVirtualKey, ID: "vk1", Name: "Caller Key",
+			ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"gpt-4o"}, Weight: ptr(1.0)},
+			},
+		})
+		granting := newPermit(permitSpec{
+			Type: PermitAccessProfile, ID: "ap1", Name: "Profile",
+			AllowAllProviders: true,
+		})
+		access := NewAccess(held(refusing, granting), nil, "", nil, configured("openai", "anthropic"))
+
+		// The gate the request path enforces with admits the pair, through the granting permit.
+		require.True(t, access.IsModelAllowed("openai", "gpt-4o-mini"))
+
+		assert.ElementsMatch(t, []string{"openai", "anthropic"}, access.GrantedProvidersForModel("gpt-4o-mini"))
+
+		candidates := make([]string, 0, 2)
+		for _, candidate := range access.ProvidersForModel("gpt-4o-mini") {
+			candidates = append(candidates, candidate.Provider)
+		}
+		assert.ElementsMatch(t, []string{"openai", "anthropic"}, candidates,
+			"the two answers must agree, and with IsModelAllowed")
+	})
+
+	t.Run("a resolver that supplied no provider set answers as before", func(t *testing.T) {
+		access := NewAccess(held(newBase()), nil, "", nil)
+
+		assert.Equal(t, []string{"bedrock"}, access.GrantedProvidersForModel("claude-haiku-4-5"))
+	})
+}
+
+// Both listing methods must answer for a provider exactly when the gate the request path enforces
+// with does. Over-inclusion advertises what a request would be refused; under-inclusion hides what
+// it would be served, which is the defect the allow-all completion exists to fix. The matrix walks
+// permit shapes (naming a provider and allowing it, naming and refusing it, blacklisting the model,
+// allow-all with and without rows, granting nothing), one and two caller permits, each scoping
+// option under each composition mode, and with and without a configured-provider set.
+func TestListedProvidersAlwaysMatchTheEnforcementGate(t *testing.T) {
+	const model = "gpt-4o-mini"
+	all := []string{"openai", "anthropic", "mistral"}
+
+	type spec struct {
+		name string
+		make func() *Permit
+	}
+	specs := []spec{
+		{"names-openai-allow-all-models", func() *Permit {
+			return newPermit(permitSpec{Type: PermitVirtualKey, ID: "p", Name: "p", ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"*"}, Weight: ptr(1.0), KeyIDs: []string{"*"}}}})
+		}},
+		{"names-openai-refuses-model", func() *Permit {
+			return newPermit(permitSpec{Type: PermitVirtualKey, ID: "p", Name: "p", ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"gpt-4o"}, Weight: ptr(1.0)}}})
+		}},
+		{"names-openai-blacklists-model", func() *Permit {
+			return newPermit(permitSpec{Type: PermitVirtualKey, ID: "p", Name: "p", ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"*"}, BlacklistedModels: []string{model}, Weight: ptr(1.0)}}})
+		}},
+		{"allow-all-no-rows", func() *Permit {
+			return newPermit(permitSpec{Type: PermitAccessProfile, ID: "p", Name: "p", AllowAllProviders: true})
+		}},
+		{"allow-all-plus-openai-row", func() *Permit {
+			return newPermit(permitSpec{Type: PermitAccessProfile, ID: "p", Name: "p", AllowAllProviders: true,
+				ProviderPermits: []schemas.ProviderPermit{{Provider: "openai", AllowedModels: []string{"gpt-4o"}, Weight: ptr(1.0)}}})
+		}},
+		{"no-rows-no-allow-all", func() *Permit {
+			return newPermit(permitSpec{Type: PermitVirtualKey, ID: "p", Name: "p"})
+		}},
+		{"names-mistral-allow-all-models", func() *Permit {
+			return newPermit(permitSpec{Type: PermitVirtualKey, ID: "p", Name: "p", ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "mistral", AllowedModels: []string{"*"}, Weight: ptr(1.0)}}})
+		}},
+	}
+	scopings := []spec{
+		{"none", func() *Permit { return nil }},
+		{"scope-openai-only", func() *Permit {
+			return newPermit(permitSpec{Type: PermitProject, ID: "s", Name: "s", ProviderPermits: []schemas.ProviderPermit{
+				{Provider: "openai", AllowedModels: []string{"*"}}}})
+		}},
+		{"scope-allow-all", func() *Permit {
+			return newPermit(permitSpec{Type: PermitProject, ID: "s", Name: "s", AllowAllProviders: true})
+		}},
+	}
+	modes := []CompositionMode{"", Union, Intersect}
+
+	checked, violations := 0, 0
+	report := func(label, method, provider string, inAnswer, allowed bool) {
+		if inAnswer != allowed {
+			violations++
+			t.Errorf("%s: %s(%q) = %v, but IsModelAllowed = %v", label, method, provider, inAnswer, allowed)
+		}
+	}
+
+	for i, a := range specs {
+		for j, b := range append([]spec{{"<none>", func() *Permit { return nil }}}, specs...) {
+			for _, sc := range scopings {
+				for _, mode := range modes {
+					scoping := sc.make()
+					if scoping == nil && mode != "" {
+						continue // mode is irrelevant without a scoping permit
+					}
+					if scoping != nil && mode == "" {
+						continue
+					}
+					for _, withLister := range []bool{true, false} {
+						bases := []*Permit{a.make()}
+						if bb := b.make(); bb != nil {
+							bases = append(bases, bb)
+						}
+						opts := []AccessOption{}
+						if withLister {
+							opts = append(opts, configured(all...))
+						}
+						var sp schemas.Permit
+						if scoping != nil {
+							sp = scoping
+						}
+						acc := NewAccess(held(bases...), sp, mode, nil, opts...)
+						label := fmt.Sprintf("a=%d/%s b=%d/%s scope=%s mode=%q lister=%v", i, a.name, j, b.name, sc.name, mode, withLister)
+
+						granted := map[string]bool{}
+						for _, p := range acc.GrantedProvidersForModel(model) {
+							granted[p] = true
+						}
+						cands := map[string]bool{}
+						for _, c := range acc.ProvidersForModel(model) {
+							cands[c.Provider] = true
+						}
+						for _, p := range all {
+							allowed := acc.IsModelAllowed(p, model)
+							checked++
+							if withLister {
+								report(label, "GrantedProvidersForModel", p, granted[p], allowed)
+								report(label, "ProvidersForModel", p, cands[p], allowed)
+							} else if granted[p] && !allowed {
+								report(label, "GrantedProvidersForModel(no lister)", p, true, allowed)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	t.Logf("checked %d provider-assertions across the composition matrix", checked)
 }

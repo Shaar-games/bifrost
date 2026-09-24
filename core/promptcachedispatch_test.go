@@ -440,6 +440,27 @@ func TestPrepareResponsesRequest_PassesThroughForOpenAI(t *testing.T) {
 	assert.Same(t, req, out, "OpenAI understands namespace tools; the request must dispatch unchanged")
 }
 
+// TestPrepareResponsesRequest_FlattensForChatFallbackOnOpenAIWire covers an
+// OpenAI-compatible custom provider whose Responses traffic a plugin converts to Chat
+// Completions: the base provider accepts namespaces, but the chat wire does not.
+func TestPrepareResponsesRequest_FlattensForChatFallbackOnOpenAIWire(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyChangeRequestType, schemas.ChatCompletionRequest)
+	req := responsesReqWithNamespaces(schemas.OpenAI)
+
+	out, bifrostErr := prepareResponsesRequest(ctx, &schemas.ProviderConfig{}, stubProvider{key: schemas.OpenAI}, schemas.Key{}, req)
+
+	require.Nil(t, bifrostErr)
+	require.Len(t, out.Params.Tools, 2)
+	assert.Equal(t, "namespace_a__js", *out.Params.Tools[0].Name)
+	assert.Equal(t, "namespace_b__js", *out.Params.Tools[1].Name)
+	require.Len(t, out.NamespaceToolAliases, 2)
+
+	chat := out.ToChatRequest()
+	require.NotNil(t, chat)
+	require.Len(t, chat.Params.Tools, 2)
+}
+
 func TestPrepareResponsesRequest_ProviderAnswerWins(t *testing.T) {
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	req := responsesReqWithNamespaces(schemas.Bedrock)

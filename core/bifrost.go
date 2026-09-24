@@ -7586,7 +7586,11 @@ func prepareResponsesRequest(ctx *schemas.BifrostContext, config *schemas.Provid
 		return nil, nil
 	}
 	var supported bool
-	if capable, ok := provider.(schemas.ResponsesNamespaceToolProvider); ok {
+	if changeType, ok := ctx.Value(schemas.BifrostContextKeyChangeRequestType).(schemas.RequestType); ok && changeType == schemas.ChatCompletionRequest {
+		// The request is dispatched through ToChatRequest, whose wire has no namespace
+		// container, whatever the provider's Responses surface would accept.
+		supported = false
+	} else if capable, ok := provider.(schemas.ResponsesNamespaceToolProvider); ok {
 		supported = capable.SupportsResponsesNamespaceTools(ctx, key, r.Model)
 	} else {
 		supported = providerUtils.ResponsesNamespaceToolsSupported(ctx, schemas.ResolveBaseProvider(ctx, provider.GetProviderKey()), r.Model)

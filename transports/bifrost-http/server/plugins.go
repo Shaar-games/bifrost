@@ -154,7 +154,14 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
 
 	default:
-		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
+		plugin, found, err := instantiateStaticPlugin(ctx, name, pluginConfig, bifrostConfig)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return plugin, nil
+		}
+		return nil, fmt.Errorf("unknown built-in or static plugin: %s", name)
 	}
 }
 
